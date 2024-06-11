@@ -1,0 +1,263 @@
+// User.java
+@Entity
+public class User {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String username;
+    private String email;
+    private String password;
+    // getters and setters
+}
+
+// Task.java
+@Entity
+public class Task {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    private String title;
+    private String description;
+    private boolean completed;
+    @ManyToOne
+    @JoinColumn(name = "user_id")
+    private User user;
+    // getters and setters
+}
+
+// UserRepository.java
+public interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByUsername(String username);
+}
+
+// TaskRepository.java
+public interface TaskRepository extends JpaRepository<Task, Long> {
+    List<Task> findByUserId(Long userId);
+}
+
+// Implement Service
+/ UserService.java
+@Service
+public class UserService implements UserDetailsService {
+    @Autowired
+    private UserRepository userRepository;
+    @Autowired
+    private BCryptPasswordEncoder bCryptPasswordEncoder;
+
+    public User registerUser(User user) {
+        user.setPassword(bCryptPasswordEncoder.encode(user.getPassword()));
+        return userRepository.save(user);
+    }
+
+    public User findByUsername(String username) {
+        return userRepository.findByUsername(username).orElse(null);
+    }
+
+    @Override
+    public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException {
+        User user = findByUsername(username);
+        if (user == null) throw new UsernameNotFoundException("User not found");
+        return new org.springframework.security.core.userdetails.User(user.getUsername(), user.getPassword(), new ArrayList<>());
+    }
+}
+
+// TaskService.java
+@Service
+public class TaskService {
+    @Autowired
+    private TaskRepository taskRepository;
+
+    public List<Task> getTasksForUser(Long userId) {
+        return taskRepository.findByUserId(userId);
+    }
+
+    public Task createTask(Task task) {
+        return taskRepository.save(task);
+    }
+
+    public Task updateTask(Task task) {
+        return taskRepository.save(task);
+    }
+
+    public void deleteTask(Long taskId) {
+        taskRepository.deleteById(taskId);
+    }
+}
+
+//Creat Controllers
+
+// AuthController.java
+@RestController
+@RequestMapping("/auth")
+public class AuthController {
+    @Autowired
+    private UserService userService;
+    @Autowired
+    private JwtUtil jwtUtil;
+    @Autowired
+    private AuthenticationManager authenticationManager;
+
+    @PostMapping("/register")
+    public ResponseEntity<?> registerUser(@RequestBody User user) {
+        User newUser = userService.registerUser(user);
+        return ResponseEntity.ok(newUser);
+    }
+
+    @PostMapping("/login")
+    public ResponseEntity<?> loginUser(@RequestBody AuthRequest authRequest) throws Exception {
+        try {
+            authenticationManager.authenticate(new UsernamePasswordAuthenticationToken(authRequest.getUsername(), authRequest.getPassword()));
+        } catch (BadCredentialsException e) {
+            throw new Exception("Incorrect username or password", e);
+        }
+        final UserDetails userDetails = userService.loadUserByUsername(authRequest.getUsername());
+        final String jwt = jwtUtil.generateToken(userDetails);
+        return ResponseEntity.ok(new AuthResponse(jwt));
+    }
+}
+
+// TaskController.java
+@RestController
+@RequestMapping("/tasks")
+public class TaskController {
+    @Autowired
+    private TaskService taskService;
+    @Autowired
+    private UserService userService;
+
+    @GetMapping
+    public ResponseEntity<?> getTasks(Principal principal) {
+        User user = userService.findByUsername(principal.getName());
+        List<Task> tasks = taskService.getTasksForUser(user.getId());
+        return ResponseEntity.ok(tasks);
+    }
+
+    @PostMapping
+    public ResponseEntity<?> createTask(@RequestBody Task task, Principal principal) {
+        User user = userService.findByUsername(principal.getName());
+        task.setUser(user);
+        Task newTask = taskService.createTask(task);
+        return ResponseEntity.ok(newTask);
+    }
+
+    @PutMapping("/{id}")
+    public ResponseEntity<?> updateTask(@PathVariable Long id, @RequestBody Task task, Principal principal) {
+        User user = userService.findByUsername(principal.getName());
+        task.setUser(user);
+        task.setId(id);
+        Task updatedTask = taskService.updateTask(task);
+        return ResponseEntity.ok(updatedTask);
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<?> deleteTask(@PathVariable Long id) {
+        taskService.deleteTask(id);
+        return ResponseEntity.ok().build();
+    }
+}
+//JWT and Security Configuration
+
+// JwtUtil.java
+@Component
+public class JwtUtil {
+    @Value("${jwt.secret}")
+    private String secret;
+
+    public String generateToken(UserDetails userDetails) {
+        Map<String, Object> claims = new HashMap<>();
+        return createToken(claims, userDetails.getUsername());
+    }
+
+    private String createToken(Map<String, Object> claims, String subject) {
+        return Jwts.builder().setClaims(claims).setSubject(subject).setIssuedAt(new Date(System.currentTimeMillis()))
+                .setExpiration(new Date(System.currentTimeMillis() + 1000 * 60 * 60 * 10))
+                .signWith(SignatureAlgorithm.HS256, secret).compact();
+    }
+
+    public String extractUsername(String token) {
+        return extractClaim(token, Claims::getSubject);
+    }
+
+    public <T> T extractClaim(String token, Function<Claims, T> claimsResolver) {
+        final Claims claims = extractAllClaims(token);
+        return claimsResolver.apply(claims);
+    }
+
+    private Claims extractAllClaims(String token) {
+        return Jwts.parser().setSigningKey(secret).parseClaimsJws(token).getBody();
+    }
+
+    public Boolean validateToken(String token, UserDetails userDetails) {
+        final String username = extractUsername(token);
+        return (username.equals(userDetails.getUsername()) && !isTokenExpired(token));
+    }
+
+    private Boolean isTokenExpired(String token) {
+        return extractExpiration(token).before(new Date());
+    }
+
+    private Date extractExpiration(String token) {
+        return extractClaim(token, Claims::getExpiration);
+    }
+}
+
+// WebSecurityConfig.java
+@EnableWebSecurity
+public class WebSecurityConfig extends WebSecurityConfigurerAdapter {
+    @Autowired
+    private UserService userService;
+    @Autowired
+    private JwtRequestFilter jwtRequestFilter;
+
+    @Override
+    protected void configure(AuthenticationManagerBuilder auth) throws Exception {
+        auth.userDetailsService(userService).passwordEncoder(new BCryptPasswordEncoder());
+    }
+
+    @Override
+    protected void configure(HttpSecurity http) throws Exception {
+        http.csrf().disable()
+            .authorizeRequests().antMatchers("/auth/**").permitAll()
+            .anyRequest().authenticated()
+            .and().sessionManagement()
+            .sessionCreationPolicy(SessionCreationPolicy.STATELESS);
+        http.addFilterBefore(jwtRequestFilter, UsernamePasswordAuthenticationFilter.class);
+    }
+
+    @Bean
+    @Override
+    public AuthenticationManager authenticationManagerBean() throws Exception {
+        return super.authenticationManagerBean();
+    }
+}
+
+// JwtRequestFilter.java
+@Component
+public class JwtRequestFilter extends OncePerRequestFilter {
+    @Autowired
+    private UserService userService;
+    @Autowired
+    private JwtUtil jwtUtil;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
+            throws ServletException, IOException {
+        final String authorizationHeader = request.getHeader("Authorization");
+        String username = null;
+        String jwt = null;
+        if (authorizationHeader != null && authorizationHeader.startsWith("Bearer ")) {
+            jwt = authorizationHeader.substring(7);
+            username = jwtUtil.extractUsername(jwt);
+        }
+        if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+            UserDetails userDetails = this.userService.loadUserByUsername(username);
+            if (jwtUtil.validateToken(jwt, userDetails)) {
+                UsernamePasswordAuthenticationToken usernamePasswordAuthenticationToken = new UsernamePasswordAuthenticationToken(
+                        userDetails, null, userDetails.getAuthorities());
+                usernamePasswordAuthenticationToken.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+                SecurityContextHolder.getContext().setAuthentication(usernamePasswordAuthenticationToken);
+            }
+        }
+        chain.doFilter(request, response);
+    }
+}
